@@ -123,6 +123,12 @@ class HTTPSConnectionPool:
                     return 0, b""
         return 0, b""
 
+    def idle_count(self) -> int:
+        """当前池中未过期的空闲连接数（不做 Liveness 探测，仅用于预热差额估算）"""
+        now = time.monotonic()
+        with self._lock:
+            return sum(1 for ts, _ in self._pool if (now - ts) <= self.max_idle_sec)
+
     def close_all(self) -> None:
         with self._lock:
             conns = [c for _, c in self._pool]

@@ -21,8 +21,30 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from .engines import ASREngineProtocol, BaseASREngine, SogouEngine, coerce_engine
+from .audio import compute_rms
 from .models import DEFAULT_ENGINE_WORKERS, EngineMetrics, Segment
 from .organizer import DoubaoOrganizer, StreamingLLMOrganizer
+
+_PUNC_END = tuple("。！？!?；;，,、：:")
+
+
+def _split_pcm_for_hedge(pcm: bytes, min_sec: float = 4.0) -> Optional[Tuple[bytes, bytes]]:
+    """在分片中部 (35%~65%) 能量最低的 100ms 窗口处一分为二（切点按 20ms 对齐）；过短分片返回 None"""
+    win = 3200
+    n_win = len(pcm) // win
+    if n_win < int(min_sec * 10):
+        return None
+    lo, hi = int(n_win * 0.35), int(n_win * 0.65)
+    best = min(range(lo, hi + 1), key=lambda w: compute_rms(pcm[w * win : (w + 1) * win]))
+    cut = best * win + 1280
+    return pcm[:cut], pcm[cut:]
+
+
+def _join_two_texts(a: str, b: str) -> str:
+    a, b = a.strip(), b.strip()
+    if not a or not b:
+        return a or b
+    return a + b if a.endswith(_PUNC_END) else a + "，" + b
 
 
 class _SegmentTaskState:
@@ -38,9 +60,11 @@ class _SegmentTaskState:
         "done",
         "started_at",
         "active_engines",
+        "inflight",
         "tried_engines",
         "failover_chain",
         "hedged",
+        "hedge_count",
         "result_seg",
     )
 
@@ -53,10 +77,13 @@ class _SegmentTaskState:
         self.lock = threading.Lock()
         self.done = False
         self.started_at = 0.0
-        self.active_engines: Set[str] = set()
+        # 引擎名 -> 该引擎上正在进行的尝试次数（同引擎对冲时同一引擎可能有多个并发尝试）
+        self.active_engines: Dict[str, int] = {}
+        self.inflight = 0
         self.tried_engines: Set[str] = set()
         self.failover_chain: List[str] = []
         self.hedged = False
+        self.hedge_count = 0
         self.result_seg: Optional[Segment] = None
 
 
@@ -255,7 +282,8 @@ class OmniScheduler:
             eng_obj = self.engines.get(eng_name)
             if eng_obj is not None and hasattr(eng_obj, "prewarm"):
                 try:
-                    eng_obj.prewarm(min(12, workers_cfg.get(eng_name, 8)))
+                    # 预热连接数与该引擎并发线程数对齐（引擎内部按差额补齐，重复调用不会超建）
+                    eng_obj.prewarm(max(1, workers_cfg.get(eng_name, 8)))
                 except Exception:
                     pass
         if organize:
@@ -345,11 +373,19 @@ class OmniScheduler:
 
         # ==================== 模式 A (默认): Omni 动态抢占 + 熔断容灾 + 长尾冲刺 ====================
         task_queue: "queue.Queue[Optional[_SegmentTaskState]]" = queue.Queue()
-        all_tasks: List[_SegmentTaskState] = []
-        tasks_lock = threading.Lock()
+        state_lock = threading.Lock()
+        running: Set[_SegmentTaskState] = set()  # 已开始执行且尚未完成的分片（对冲/超时扫描只需遍历它）
+        pending = [0]  # 已入队但尚未完成的有声分片数
         producer_done = threading.Event()
+        all_done = threading.Event()
         completed_segments: Dict[int, Segment] = {}
         completed_lock = threading.Lock()
+        lat_samples: List[float] = []  # 本轮成功分片的单次请求耗时样本（用于自适应同引擎对冲阈值）
+        multi_engine = len(active_engines) > 1
+
+        def _check_all_done_locked() -> None:
+            if producer_done.is_set() and pending[0] <= 0:
+                all_done.set()
 
         def _complete_task(
             task: _SegmentTaskState,
@@ -377,6 +413,11 @@ class OmniScheduler:
                 )
                 task.result_seg = seg
 
+            with state_lock:
+                running.discard(task)
+                if winner_engine not in ("silent", "failed", "timeout"):
+                    lat_samples.append(latency_sec)
+
             dur = max(0.1, task.end_sec - task.start_sec)
             base_eng = winner_engine.split("(")[0]
             if base_eng in metrics_map:
@@ -384,51 +425,121 @@ class OmniScheduler:
 
             with completed_lock:
                 completed_segments[task.idx] = seg
-            if llm_pipeline is not None:
-                llm_pipeline.on_segment_ready(seg)
-            if on_segment is not None:
-                on_segment(seg)
+            try:
+                if llm_pipeline is not None:
+                    if producer_done.is_set() and task_queue.qsize() == 0:
+                        # 所有分片均已派发、仅剩在途请求：此后凑齐的 LLM 桶位于关键路径，切换为尾声微块
+                        llm_pipeline.enter_tail_mode()
+                    llm_pipeline.on_segment_ready(seg)
+                if on_segment is not None:
+                    on_segment(seg)
+            finally:
+                # 必须在回调执行完毕之后再递减计数，确保主线程被唤醒时最后一段已送入 LLM 流水线；
+                # 静音分片由生产者线程同步定稿，从未计入 pending
+                if winner_engine != "silent":
+                    with state_lock:
+                        pending[0] -= 1
+                        _check_all_done_locked()
             return True
 
-        def _execute_on_engine(task: _SegmentTaskState, eng_name: str, is_hedged: bool = False) -> None:
+        def _begin_attempt(task: _SegmentTaskState, eng_name: str, record_chain: bool) -> bool:
             with task.lock:
                 if task.done:
-                    return
-                if not task.started_at:
+                    return False
+                first = not task.started_at
+                if first:
                     task.started_at = time.perf_counter()
-                task.active_engines.add(eng_name)
+                task.active_engines[eng_name] = task.active_engines.get(eng_name, 0) + 1
+                task.inflight += 1
                 task.tried_engines.add(eng_name)
-                if not is_hedged:
+                if record_chain:
                     task.failover_chain.append(eng_name)
+                if first:
+                    with state_lock:
+                        running.add(task)
+            return True
 
+        def _end_attempt(task: _SegmentTaskState, eng_name: str) -> None:
+            with task.lock:
+                c = task.active_engines.get(eng_name, 0) - 1
+                if c > 0:
+                    task.active_engines[eng_name] = c
+                else:
+                    task.active_engines.pop(eng_name, None)
+                task.inflight -= 1
+
+        def _call_engine(eng_name: str, task: _SegmentTaskState, pcm: Optional[bytes] = None) -> str:
+            return (
+                self.engines[eng_name].transcribe_pcm(
+                    task.pcm_bytes if pcm is None else pcm,
+                    language=language,
+                    hotwords=hotwords,
+                    context=context,
+                )
+                or ""
+            ).strip()
+
+        def _call_engine_split(eng_name: str, task: _SegmentTaskState, halves: Tuple[bytes, bytes]) -> str:
+            """分裂对冲：把慢分片在静音谷底一分为二，两半并发识别后拼接（规避服务端对个别整段音频的病态慢解码）"""
+            res_b: List[str] = []
+            err_b: List[BaseException] = []
+
+            def _run_b() -> None:
+                try:
+                    res_b.append(_call_engine(eng_name, task, halves[1]))
+                except BaseException as e:  # noqa: BLE001 - 在主调线程中重新抛出
+                    err_b.append(e)
+
+            th = threading.Thread(target=_run_b, name="omni-lite-split-hedge", daemon=True)
+            th.start()
+            txt_a = _call_engine(eng_name, task, halves[0])
+            th.join()
+            if err_b:
+                raise err_b[0]
+            return _join_two_texts(txt_a, res_b[0] if res_b else "")
+
+        def _execute_on_engine(task: _SegmentTaskState, eng_name: str, is_hedged: bool = False) -> None:
+            halves: Optional[Tuple[bytes, bytes]] = None
+            if is_hedged:
+                with task.lock:
+                    same_engine_hedge = eng_name in task.active_engines
+                if same_engine_hedge:
+                    # 同引擎对冲时整段重发往往同样慢（服务端对个别内容存在确定性慢解码），改为分裂对冲
+                    halves = _split_pcm_for_hedge(task.pcm_bytes)
+            if not _begin_attempt(task, eng_name, record_chain=not is_hedged):
+                return
             t0 = time.perf_counter()
             try:
-                txt = (
-                    self.engines[eng_name].transcribe_pcm(
-                        task.pcm_bytes,
-                        language=language,
-                        hotwords=hotwords,
-                        context=context,
-                    )
-                    or ""
-                ).strip()
+                txt = _call_engine_split(eng_name, task, halves) if halves else _call_engine(eng_name, task)
                 dt = time.perf_counter() - t0
-                if not txt and task.rms >= 280.0 and len(active_engines) > 1:
+                if not txt and task.rms >= 280.0:
                     with task.lock:
-                        can_retry = not task.done and len(task.tried_engines) < len(active_engines)
+                        others_inflight = task.inflight > 1
+                        can_retry = (
+                            not task.done
+                            and multi_engine
+                            and len(task.tried_engines) < len(active_engines)
+                        )
+                    if is_hedged and others_inflight:
+                        # 对冲尝试在有声段上返回空文本：不抢先定稿，让仍在进行的原始尝试决定结果
+                        return
                     if can_retry:
                         self._record_failure(metrics_map, eng_name, RuntimeError("empty_transcript_on_voiced_segment"))
                         if not is_hedged:
+                            _end_attempt(task, eng_name)
+                            eng_name = ""
                             _failover_task(task)
                         return
                 _complete_task(task, txt, eng_name, dt, is_hedged=is_hedged)
             except Exception as exc:
                 self._record_failure(metrics_map, eng_name, exc)
                 if not is_hedged:
+                    _end_attempt(task, eng_name)
+                    eng_name = ""
                     _failover_task(task)
             finally:
-                with task.lock:
-                    task.active_engines.discard(eng_name)
+                if eng_name:
+                    _end_attempt(task, eng_name)
 
         def _failover_task(task: _SegmentTaskState) -> None:
             max_attempts = max(3, len(active_engines))
@@ -438,32 +549,19 @@ class OmniScheduler:
                         return
                     tried = set(task.tried_engines)
                 backup_eng = self._pick_failover_engine(active_engines, tried)
-                with task.lock:
-                    if task.done:
-                        return
-                    task.active_engines.add(backup_eng)
-                    task.tried_engines.add(backup_eng)
-                    task.failover_chain.append(backup_eng)
+                if not _begin_attempt(task, backup_eng, record_chain=True):
+                    return
                 t_f0 = time.perf_counter()
                 try:
-                    txt = (
-                        self.engines[backup_eng].transcribe_pcm(
-                            task.pcm_bytes,
-                            language=language,
-                            hotwords=hotwords,
-                            context=context,
-                        )
-                        or ""
-                    ).strip()
+                    txt = _call_engine(backup_eng, task)
                     dt_f = time.perf_counter() - t_f0
-                    label = f"{backup_eng}(failover)" if len(active_engines) > 1 else backup_eng
+                    label = f"{backup_eng}(failover)" if multi_engine else backup_eng
                     _complete_task(task, txt, label, dt_f, is_hedged=False)
                     return
                 except Exception as exc:
                     self._record_failure(metrics_map, backup_eng, exc)
                 finally:
-                    with task.lock:
-                        task.active_engines.discard(backup_eng)
+                    _end_attempt(task, backup_eng)
 
             _complete_task(task, "", "failed", 0.0, is_hedged=False)
 
@@ -473,25 +571,87 @@ class OmniScheduler:
                 my_rtf = self._ewma_rtf.get(eng_name, 0.05)
             return my_rtf <= max(0.09, best_rtf * 1.65)
 
+        def _same_engine_hedge_threshold() -> float:
+            """
+            同引擎（新连接 + 分裂）对冲阈值：取本轮成功请求耗时 P90 的 1.5 倍，限制在 [0.6s, 4.0s]。
+            对冲只会由「队列已空的空闲 worker」发起（即只发生在尾声或生产者供给不足时），因此可以激进一些。
+            """
+            with state_lock:
+                n = len(lat_samples)
+                if n < 4:
+                    return 1.5
+                srt = sorted(lat_samples)
+            p90 = srt[min(n - 1, int(0.9 * n))]
+            return max(0.6, min(4.0, 1.5 * p90))
+
+        def _hedge_threshold_locked(t: _SegmentTaskState, my_engine: str, same_thr: float) -> Optional[float]:
+            """返回分片 `t` 在当前状态下被 `my_engine` 对冲所需的最小已耗时；None 表示不可对冲（需持有 t.lock）"""
+            if multi_engine and my_engine not in t.active_engines:
+                # 跨引擎对冲：首次 0.30s 即冲刺，此后每 6s 才允许再次冲刺
+                return 6.0 if t.hedged else 0.30
+            if t.inflight >= 3:
+                return None
+            # 同引擎新连接对冲：自适应阈值，且每多一次对冲阈值线性递增，避免对单个慢段反复加压
+            return same_thr * (1 + t.hedge_count)
+
+        def _pick_straggler(my_engine: str) -> Optional[_SegmentTaskState]:
+            if multi_engine and not _is_fast_tier(my_engine):
+                return None
+            with state_lock:
+                cands = list(running)
+            if not cands:
+                return None
+            same_thr = _same_engine_hedge_threshold()
+            now = time.perf_counter()
+            best: Optional[_SegmentTaskState] = None
+            best_el = 0.0
+            for t in cands:
+                with t.lock:
+                    if t.done or not t.started_at:
+                        continue
+                    el = now - t.started_at
+                    thr = _hedge_threshold_locked(t, my_engine, same_thr)
+                    if thr is not None and thr <= el < 18.0 and el > best_el:
+                        best, best_el = t, el
+            if best is None:
+                return None
+            with best.lock:
+                thr = _hedge_threshold_locked(best, my_engine, same_thr)
+                if best.done or thr is None or (time.perf_counter() - best.started_at) < thr:
+                    return None
+                best.hedged = True
+                best.hedge_count += 1
+            return best
+
+        def _expire_timeouts() -> None:
+            with state_lock:
+                cands = list(running)
+            now = time.perf_counter()
+            for t in cands:
+                if not t.done and t.started_at > 0 and (now - t.started_at) >= 18.0:
+                    _complete_task(t, "", "timeout", now - t.started_at, is_hedged=False)
+
         def _worker_loop(my_engine: str) -> None:
-            while True:
+            while not all_done.is_set():
+                task: Optional[_SegmentTaskState] = None
                 if (
                     producer_done.is_set()
-                    and len(active_engines) > 1
+                    and multi_engine
                     and 0 < task_queue.qsize() <= 12
                     and not _is_fast_tier(my_engine)
                 ):
-                    task = None
+                    # 尾声准入控制：慢梯队引擎不再领取尾部任务，交给快梯队
+                    all_done.wait(0.02)
                 else:
                     try:
-                        task = task_queue.get(timeout=0.03)
+                        task = task_queue.get(timeout=0.02)
                     except queue.Empty:
                         task = None
 
                 if task is not None:
                     try:
                         chosen_engine = my_engine
-                        if not self._is_engine_healthy(my_engine) and len(active_engines) > 1:
+                        if multi_engine and not self._is_engine_healthy(my_engine):
                             with task.lock:
                                 tried_snap = set(task.tried_engines)
                             chosen_engine = self._pick_failover_engine(active_engines, tried_snap)
@@ -500,44 +660,13 @@ class OmniScheduler:
                         task_queue.task_done()
                     continue
 
-                if producer_done.is_set():
-                    with tasks_lock:
-                        unfinished = [t for t in all_tasks if not t.done]
-                    if not unfinished:
-                        break
-
-                    if (
-                        enable_hedging
-                        and len(active_engines) > 1
-                        and self._is_engine_healthy(my_engine)
-                        and _is_fast_tier(my_engine)
-                    ):
-                        now = time.perf_counter()
-                        straggler: Optional[_SegmentTaskState] = None
-                        for t in unfinished:
-                            with t.lock:
-                                elapsed_t = (now - t.started_at) if t.started_at > 0 else 0.0
-                                if not t.done and elapsed_t >= 18.0:
-                                    straggler = None
-                                    break
-                                if (
-                                    not t.done
-                                    and (not t.hedged or elapsed_t >= 6.0)
-                                    and elapsed_t >= 0.30
-                                    and my_engine not in t.active_engines
-                                ):
-                                    t.hedged = True
-                                    straggler = t
-                                    break
-                        else:
-                            straggler = None
-                        for t in unfinished:
-                            if not t.done and t.started_at > 0 and (now - t.started_at) >= 18.0:
-                                _complete_task(t, "", "timeout", now - t.started_at, is_hedged=False)
-                        if straggler is not None:
-                            _execute_on_engine(straggler, my_engine, is_hedged=True)
-                            continue
-                    time.sleep(0.01)
+                # 当前 worker 空闲（队列已空）：利用空闲并发对长尾慢分片发起对冲冲刺
+                if enable_hedging and self._is_engine_healthy(my_engine):
+                    straggler = _pick_straggler(my_engine)
+                    if straggler is not None:
+                        _execute_on_engine(straggler, my_engine, is_hedged=True)
+                        continue
+                _expire_timeouts()
 
         worker_threads: List[threading.Thread] = []
         max_w = max((workers_cfg.get(e, 8) for e in active_engines), default=1)
@@ -558,17 +687,20 @@ class OmniScheduler:
                 t_state = _SegmentTaskState(idx, s_sec, e_sec, sub_pcm, rms)
                 if rms < silence_rms_threshold:
                     _complete_task(t_state, "", "silent", 0.0)
-                    with tasks_lock:
-                        all_tasks.append(t_state)
                 else:
-                    with tasks_lock:
-                        all_tasks.append(t_state)
+                    with state_lock:
+                        pending[0] += 1
                     task_queue.put(t_state)
+        except BaseException:
+            all_done.set()  # 生产者异常：通知所有 worker 尽快退出
+            raise
         finally:
             producer_done.set()
+            with state_lock:
+                _check_all_done_locked()
 
-        for th in worker_threads:
-            th.join()
+        # 等待所有分片定稿即返回：对冲落败、仍阻塞在网络读取上的后台尝试由守护线程自行收尾，不再拖累总耗时
+        all_done.wait()
 
         with completed_lock:
             ordered_segments = [completed_segments[k] for k in sorted(completed_segments)]
@@ -578,10 +710,11 @@ class OmniScheduler:
         org_text = llm_pipeline.finalize() if llm_pipeline is not None else ""
         org_tail_sec = time.perf_counter() - t_org_tail0
 
-        metrics_dict = {
-            k: {**asdict(v), "avg_speed_x": v.avg_speed_x}
-            for k, v in metrics_map.items()
-        }
+        with self._metrics_lock:
+            metrics_dict = {
+                k: {**asdict(v), "avg_speed_x": v.avg_speed_x}
+                for k, v in metrics_map.items()
+            }
         return (
             ordered_segments,
             org_text,

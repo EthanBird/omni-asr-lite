@@ -112,6 +112,36 @@ def _get_tls_voip_encoder(bitrate: int = 24000, complexity: int = 1):
     return st, _TLS_ENCODERS.voip_ptr, _TLS_ENCODERS.voip_mv
 
 
+def _encode_ws_frames_into(
+    dll: ctypes.CDLL,
+    st,
+    ptr,
+    mv: memoryview,
+    pcm_bytes: bytes,
+    start: int,
+    end: int,
+    ws_out: bytearray,
+) -> None:
+    """将 `pcm_bytes[start:end]` (按 640B=20ms 对齐，尾帧补零) 逐帧编码并追加写入 `ws_out`"""
+    encode_fn = dll.opus_encode
+    pack_hdr = _PACK_SOGOU_WS_HDR
+    pack_hdr16 = _PACK_SOGOU_WS_HDR16
+    mask = b"\x00\x00\x00\x00"
+    for off in range(start, end, 640):
+        ch = pcm_bytes[off : off + 640]
+        if len(ch) < 640:
+            ch = ch + b"\x00" * (640 - len(ch))
+        n = encode_fn(st, ch, 320, ptr, 1280)
+        if n < 0:
+            raise RuntimeError(f"opus_encode 错误: {n}")
+        plen = n + 2
+        if plen < 126:
+            ws_out += pack_hdr(0x82, 0x80 | plen, mask, n)
+        else:
+            ws_out += pack_hdr16(0x82, 0xFE, plen, mask, n)
+        ws_out += mv[:n]
+
+
 def encode_sogou_ws_frames(pcm_bytes: bytes, bitrate: int = 24000) -> bytes:
     """
     零拷贝编码为搜狗 `OPUS_WITH_HEADER` (`>H` + 20ms Opus) 并直接写入连续 RFC 6455 二进制帧流。
@@ -121,25 +151,78 @@ def encode_sogou_ws_frames(pcm_bytes: bytes, bitrate: int = 24000) -> bytes:
         return b""
     dll = ensure_libopus()
     st, ptr, mv = _get_tls_voip_encoder(bitrate=bitrate, complexity=1)
-    encode_fn = dll.opus_encode
-    pack_hdr = _PACK_SOGOU_WS_HDR
-    pack_hdr16 = _PACK_SOGOU_WS_HDR16
     ws_out = bytearray()
-    total = len(pcm_bytes)
-    for off in range(0, total, 640):
-        ch = pcm_bytes[off : off + 640]
-        if len(ch) < 640:
-            ch = ch + b"\x00" * (640 - len(ch))
-        n = encode_fn(st, ch, 320, ptr, 1280)
-        if n < 0:
-            raise RuntimeError(f"opus_encode 错误: {n}")
-        plen = n + 2
-        if plen < 126:
-            ws_out += pack_hdr(0x82, 0x80 | plen, b"\x00\x00\x00\x00", n)
-        else:
-            ws_out += pack_hdr16(0x82, 0xFE, plen, b"\x00\x00\x00\x00", n)
-        ws_out += mv[:n]
+    _encode_ws_frames_into(dll, st, ptr, mv, pcm_bytes, 0, len(pcm_bytes), ws_out)
     return bytes(ws_out)
+
+
+def iter_sogou_ws_frames(
+    pcm_bytes: bytes,
+    bitrate: int = 24000,
+    chunk_frames: int = 50,
+) -> Iterator[bytes]:
+    """
+    `encode_sogou_ws_frames` 的分块流式版本：每编码 `chunk_frames` 个 20ms 帧 (默认 50 帧 = 1s 音频) 即产出一块
+    WebSocket 二进制帧字节，调用方可「边编码、边发送」，让 Opus 编码与网络上行 / 服务端解码完全重叠。
+    所有块按序拼接后与 `encode_sogou_ws_frames()` 的输出逐字节一致。
+    注意：生成器在被完全消费前会独占当前线程的线程局部编码器状态，请勿在同一线程中交错调用其它编码函数。
+    """
+    if not pcm_bytes:
+        return
+    dll = ensure_libopus()
+    st, ptr, mv = _get_tls_voip_encoder(bitrate=bitrate, complexity=1)
+    step = max(1, int(chunk_frames)) * 640
+    total = len(pcm_bytes)
+    for start in range(0, total, step):
+        ws_out = bytearray()
+        _encode_ws_frames_into(dll, st, ptr, mv, pcm_bytes, start, min(total, start + step), ws_out)
+        yield bytes(ws_out)
+
+
+class SogouWSFrameEncoder:
+    """
+    独占编码器状态的增量 Opus → 搜狗 WebSocket 帧编码器（供真增量流式会话使用）：
+    与线程局部编码器不同，它在多次 `encode()` 调用之间保持 Opus 编码器连续状态（不做 `OPUS_RESET_STATE`），
+    避免流式场景下每个 chunk 边界处的编码器冷启动伪影，且可安全地跨线程交替使用。
+    """
+
+    def __init__(self, bitrate: int = 24000, complexity: int = 1):
+        dll = ensure_libopus()
+        err = ctypes.c_int(0)
+        st = dll.opus_encoder_create(16000, 1, _OPUS_APPLICATION_VOIP, ctypes.byref(err))
+        if not st:
+            raise RuntimeError(f"opus_encoder_create 失败: {err.value}")
+        dll.opus_encoder_ctl(st, _OPUS_SET_BITRATE_REQUEST, int(bitrate))
+        dll.opus_encoder_ctl(st, _OPUS_SET_COMPLEXITY_REQUEST, int(complexity))
+        self._dll = dll
+        self._st = st
+        self._buf = ctypes.create_string_buffer(1280)
+        self._ptr = ctypes.cast(self._buf, ctypes.c_char_p)
+        self._mv = memoryview(self._buf).cast("B")
+        self._lock = threading.Lock()
+
+    def encode(self, pcm_bytes: bytes) -> bytes:
+        """编码任意长度 PCM（非 640B 整数倍的尾帧补零）"""
+        if not pcm_bytes:
+            return b""
+        ws_out = bytearray()
+        with self._lock:
+            if not self._st:
+                raise RuntimeError("SogouWSFrameEncoder 已关闭")
+            _encode_ws_frames_into(self._dll, self._st, self._ptr, self._mv, pcm_bytes, 0, len(pcm_bytes), ws_out)
+        return bytes(ws_out)
+
+    def close(self) -> None:
+        with self._lock:
+            st, self._st = self._st, None
+        if st:
+            self._dll.opus_encoder_destroy(st)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def encode_opus_packets(pcm_bytes: bytes, frame_ms: int = 20, bitrate: int = 24000) -> List[bytes]:

@@ -73,6 +73,20 @@ class OmniStreamSession:
         self._live_stream: Optional[Any] = None
         self._live_engine_name: str = "sogou"
         self._utt_t0: float = 0.0
+        self._warm_next_stream()
+
+    def _warm_next_stream(self) -> None:
+        """为下一句段预取一条已完成 TLS + WS Upgrade 的热连接，使开流延迟从 ~130ms 降至 ~0"""
+        for eng_name in self._active_engines:
+            eng = self.client.scheduler.engines.get(eng_name)
+            if eng is not None and hasattr(eng, "open_stream"):
+                warm = getattr(eng, "warm_one_ahead", None)
+                if warm is not None:
+                    try:
+                        warm()
+                    except Exception:
+                        pass
+                return
 
     def __enter__(self) -> "OmniStreamSession":
         return self
@@ -186,6 +200,8 @@ class OmniStreamSession:
         eng = self._live_engine_name
 
         if self._live_stream is not None:
+            # 在等待本句定稿的同时，后台预取下一句段的热连接
+            self._warm_next_stream()
             try:
                 best = (self._live_stream.finish() or "").strip()
             except Exception:

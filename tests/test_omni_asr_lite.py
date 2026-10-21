@@ -174,5 +174,133 @@ class TestOmniASRLiteSuite(unittest.TestCase):
         print(f"\n[True Incremental Stream] 收到 {len(events)} 个流式事件，最终定稿: {events[-1].text}")
 
 
+class TestPerformancePaths(unittest.TestCase):
+    """性能优化路径的离线正确性测试（不依赖网络）"""
+
+    @classmethod
+    def setUpClass(cls):
+        sample_wav = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "examples", "asr_example_zh.wav")
+        )
+        cls.pcm = audio_mod.load_pcm16k(sample_wav)
+
+    def test_native_aes_backend_matches_pure_python_and_nist_vector(self):
+        from omni_asr_lite import crypto
+
+        pure = crypto._PurePythonAES256()
+        self.assertTrue(crypto._self_test(pure))
+        self.assertTrue(crypto._self_test(crypto._AES_BACKEND))
+        for n in (0, 1, 15, 16, 17, 255, 1227, 4096):
+            key, iv, pt = os.urandom(32), os.urandom(16), os.urandom(n)
+            ct = crypto.aes_256_cbc_encrypt(key, iv, pt)
+            self.assertEqual(len(ct), (n // 16 + 1) * 16)
+            self.assertEqual(ct, pure.encrypt_cbc_pkcs7(key, iv, pt))
+
+    def test_chunked_ws_frame_encoding_is_byte_identical(self):
+        from omni_asr_lite.audio import SogouWSFrameEncoder, iter_sogou_ws_frames
+
+        pcm = self.pcm[: 32000 * 3 + 1000]  # 含非 640B 对齐的尾帧
+        whole = encode_sogou_ws_frames(pcm)
+        chunks = list(iter_sogou_ws_frames(pcm, chunk_frames=7))
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(b"".join(chunks), whole)
+
+        enc = SogouWSFrameEncoder()
+        try:
+            self.assertEqual(enc.encode(pcm), whole)  # 全新编码器的首次输出与线程局部编码器一致
+            self.assertGreater(len(enc.encode(pcm[:6400])), 0)  # 跨调用保持连续状态
+        finally:
+            enc.close()
+
+    def test_collect_all_final_sentences_until_close_frame(self):
+        import json as _json
+        from omni_asr_lite.engines import sogou as sogou_mod
+
+        def srv_frame(opcode: int, payload: bytes) -> bytes:
+            n = len(payload)
+            hdr = bytes([0x80 | opcode, n]) if n < 126 else bytes([0x80 | opcode, 126]) + n.to_bytes(2, "big")
+            return hdr + payload
+
+        def result(text: str) -> bytes:
+            return _json.dumps(
+                {"results": [{"is_final": True, "alternatives": [{"transcript": text}]}]}, ensure_ascii=False
+            ).encode("utf-8")
+
+        class FakeSock:
+            def __init__(self, data: bytes):
+                self._data = bytearray(data)
+
+            def settimeout(self, t):
+                pass
+
+            def recv(self, n):
+                out = bytes(self._data[:7])  # 故意碎片化返回，覆盖跨包拼帧
+                del self._data[:7]
+                return out
+
+            def sendall(self, b):
+                pass
+
+        stream = srv_frame(1, result("第一句。")) + srv_frame(1, result("第二句。")) + srv_frame(8, b"\x03\xe8")
+        txt = sogou_mod.SogouEngine._collect_finals(FakeSock(stream), bytearray(), time.monotonic() + 5)
+        self.assertEqual(txt, "第一句。第二句。")
+
+        with self.assertRaises(ConnectionError):  # 预热连接在首帧前被回收 -> 可安全重试的 _StaleWSError
+            sogou_mod.SogouEngine._collect_finals(FakeSock(b""), bytearray(), time.monotonic() + 5)
+
+    def test_single_engine_split_hedging_cuts_pathological_straggler(self):
+        pcm = (self.pcm + b"\x00\x00" * 4000) * 4
+        segs = list(audio_mod.iter_vad_segments_streaming(pcm, min_segment_sec=5.0, max_segment_sec=8.0))
+        self.assertGreaterEqual(len(segs), 3)
+        slow_pcm = segs[1][3]
+        calls = []
+
+        def pathological_engine(pcm_bytes: bytes, **kw) -> str:
+            calls.append(len(pcm_bytes))
+            if pcm_bytes == slow_pcm:
+                time.sleep(3.0)  # 服务端对该整段音频的确定性慢解码
+                return "整段慢结果。"
+            time.sleep(0.05)
+            return "片段。"
+
+        with OmniASR() as asr:
+            asr.register_engine("pathological", pathological_engine, workers=4)
+            got = []
+            t0 = time.perf_counter()
+            res = asr.transcribe(
+                pcm,
+                engines=["pathological"],
+                min_segment_sec=5.0,
+                max_segment_sec=8.0,
+                organize=False,
+                strict=True,
+                on_segment=got.append,
+            )
+            dt = time.perf_counter() - t0
+        self.assertLess(dt, 2.5, f"分裂对冲未生效，总耗时 {dt:.2f}s")
+        self.assertEqual(len(got), len(res.segments))
+        self.assertEqual(res.segments[1].text, "片段。片段。")
+        self.assertGreaterEqual(res.engine_metrics["pathological"]["hedged_wins"], 1)
+
+    def test_llm_fast_failure_retries_immediately_and_falls_back_without_waiting(self):
+        org = DoubaoOrganizer(timeout=5.0, hedge_delay=1.0)
+        calls = []
+
+        def flaky(body: bytes, timeout: float, fresh: bool = False):
+            calls.append(fresh)
+            return None if not fresh else "重试成功。"
+
+        with patch.object(org, "_call_once", side_effect=flaky):
+            t0 = time.perf_counter()
+            self.assertEqual(org.organize_single("测试一下"), "重试成功。")
+            self.assertLess(time.perf_counter() - t0, 0.5)  # 主请求失败后立即换新连接重试，不空等 1.0s 对冲时刻
+            self.assertEqual(calls, [False, True])
+
+        with patch.object(org, "_call_once", return_value=None):
+            t0 = time.perf_counter()
+            self.assertEqual(org.organize_single("原文保留"), "原文保留")
+            self.assertLess(time.perf_counter() - t0, 0.5)  # 主备均失败：立即降级回原文，不空等至 5s 超时
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

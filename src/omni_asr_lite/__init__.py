@@ -36,7 +36,7 @@ from .organizer import DoubaoOrganizer, StreamingLLMOrganizer, split_text_for_or
 from .scheduler import OmniScheduler
 from .stream import OmniStreamSession
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __all__ = [
     "OmniASR",
     "OmniScheduler",

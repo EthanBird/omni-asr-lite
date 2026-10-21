@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omni-asr-lite"
-version = "1.0.0"
+version = "1.1.0"
 description = "零第三方依赖、可插拔多引擎并发调度语音转文字与豆包 LLM 无锁分桶流式整理框架（内置搜狗 14 语种/方言极速 ASR 引擎，原生支持 Python 3.15t GIL=False）"
 readme = "README.md"
 requires-python = ">=3.8"

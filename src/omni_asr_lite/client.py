@@ -196,7 +196,7 @@ class OmniASR:
         hotwords: Optional[List[str]] = None,
         context: str = "",
         organize: bool = True,
-        organize_workers: int = 12,
+        organize_workers: int = 24,
         organize_chunk_chars: int = 380,
         enable_hedging: bool = True,
         strict: bool = False,

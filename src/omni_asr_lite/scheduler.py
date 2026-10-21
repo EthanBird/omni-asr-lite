@@ -97,7 +97,7 @@ class OmniScheduler:
             "sogou": SogouEngine(timeout=timeout),
         }
         self.engine_workers: Dict[str, int] = dict(DEFAULT_ENGINE_WORKERS)
-        self.organizer = DoubaoOrganizer(timeout=45.0)
+        self.organizer = DoubaoOrganizer()
 
         self._metrics_lock = threading.Lock()
         self._cooldown_until: Dict[str, float] = {"sogou": 0.0}

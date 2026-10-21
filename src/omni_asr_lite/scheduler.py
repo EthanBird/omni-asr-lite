@@ -431,7 +431,7 @@ class OmniScheduler:
                     task.active_engines.discard(eng_name)
 
         def _failover_task(task: _SegmentTaskState) -> None:
-            max_attempts = max(2, len(active_engines))
+            max_attempts = max(3, len(active_engines))
             for _ in range(max_attempts):
                 with task.lock:
                     if task.done:

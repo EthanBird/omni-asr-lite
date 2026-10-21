@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import inspect
 from typing import Callable, Iterable, List, Optional, Protocol, Set, Union, runtime_checkable
 
 
@@ -84,8 +85,9 @@ class BaseASREngine(ABC):
 class CallableASREngine(BaseASREngine):
     """
     函数式 ASR 引擎适配器：
-    允许用户直接将一个普通 Python 函数 `fn(pcm_bytes, *, language="zh", hotwords=None, context="") -> str`
-    或 `fn(pcm_bytes) -> str` 注册为完整的多线程可调度引擎。
+    在初始化时通过 `inspect.signature` 静态探测目标函数签名，
+    严格区分单参数 `fn(pcm_bytes)` 与完整关键字参数 `fn(pcm_bytes, *, language, hotwords, context, timeout)`，
+    绝不捕获用户函数体内部抛出的 `TypeError`。
     """
 
     def __init__(
@@ -106,6 +108,20 @@ class CallableASREngine(BaseASREngine):
         )
         self._prewarm_fn = prewarm_fn
         self._close_fn = close_fn
+        self._accepts_kwargs = self._probe_signature(fn)
+
+    @staticmethod
+    def _probe_signature(fn: Callable[..., str]) -> bool:
+        try:
+            sig = inspect.signature(fn)
+            for p in sig.parameters.values():
+                if p.kind == inspect.Parameter.VAR_KEYWORD:
+                    return True
+                if p.name in ("language", "hotwords", "context", "timeout"):
+                    return True
+            return False
+        except (ValueError, TypeError):
+            return True
 
     def transcribe_pcm(
         self,
@@ -116,7 +132,7 @@ class CallableASREngine(BaseASREngine):
         context: str = "",
         timeout: Optional[float] = None,
     ) -> str:
-        try:
+        if self._accepts_kwargs:
             return self._fn(
                 pcm_bytes,
                 language=language,
@@ -124,9 +140,7 @@ class CallableASREngine(BaseASREngine):
                 context=context,
                 timeout=timeout,
             )
-        except TypeError:
-            # 兼容仅接收单个 pcm_bytes 参数的极简函数 fn(pcm_bytes) -> str
-            return self._fn(pcm_bytes)
+        return self._fn(pcm_bytes)
 
     def prewarm(self, count: int = 4) -> None:
         if self._prewarm_fn is not None:

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from .base import ASREngineProtocol, BaseASREngine, CallableASREngine, coerce_engine
-from .sogou import SOGOU_LANGUAGES, SogouEngine, normalize_sogou_language
+from .sogou import SOGOU_LANGUAGES, SogouEngine, SogouStreamConnection, normalize_sogou_language
 
 __all__ = [
     "ASREngineProtocol",
@@ -8,6 +8,7 @@ __all__ = [
     "CallableASREngine",
     "coerce_engine",
     "SogouEngine",
+    "SogouStreamConnection",
     "SOGOU_LANGUAGES",
     "normalize_sogou_language",
 ]

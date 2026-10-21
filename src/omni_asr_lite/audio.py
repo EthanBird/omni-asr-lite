@@ -33,6 +33,7 @@ _OPUS_SET_COMPLEXITY_REQUEST = 4010
 _OPUS_RESET_STATE = 4028
 
 _PACK_SOGOU_WS_HDR = struct.Struct("!BB4sH").pack
+_PACK_SOGOU_WS_HDR16 = struct.Struct("!BBH4sH").pack
 _TLS_ENCODERS = threading.local()
 
 
@@ -81,51 +82,73 @@ def _load_libopus() -> Optional[ctypes.CDLL]:
 _LIBOPUS = _load_libopus()
 
 
+def ensure_libopus() -> ctypes.CDLL:
+    """确保 libopus 动态库已成功加载；若缺失则抛出明确的安装指引异常，绝不静默返回空字节"""
+    if _LIBOPUS is None:
+        raise RuntimeError(
+            "未找到 libopus 动态库！Windows 已内置 _bin/opus.dll；"
+            "Linux 请执行 `sudo apt-get install -y libopus0` (或 `dnf install opus`)，"
+            "macOS 请执行 `brew install opus`。"
+        )
+    return _LIBOPUS
+
+
 def _get_tls_voip_encoder(bitrate: int = 24000, complexity: int = 1):
+    dll = ensure_libopus()
     st = getattr(_TLS_ENCODERS, "voip_st", None)
     if st is None:
         err = ctypes.c_int(0)
-        st = _LIBOPUS.opus_encoder_create(16000, 1, _OPUS_APPLICATION_VOIP, ctypes.byref(err))
+        st = dll.opus_encoder_create(16000, 1, _OPUS_APPLICATION_VOIP, ctypes.byref(err))
         if not st:
             raise RuntimeError(f"opus_encoder_create 失败: {err.value}")
         _TLS_ENCODERS.voip_st = st
-        _TLS_ENCODERS.voip_buf = ctypes.create_string_buffer(512)
+        _TLS_ENCODERS.voip_buf = ctypes.create_string_buffer(1280)
         _TLS_ENCODERS.voip_ptr = ctypes.cast(_TLS_ENCODERS.voip_buf, ctypes.c_char_p)
         _TLS_ENCODERS.voip_mv = memoryview(_TLS_ENCODERS.voip_buf).cast("B")
     else:
-        _LIBOPUS.opus_encoder_ctl(st, _OPUS_RESET_STATE, 0)
-    _LIBOPUS.opus_encoder_ctl(st, _OPUS_SET_BITRATE_REQUEST, int(bitrate))
-    _LIBOPUS.opus_encoder_ctl(st, _OPUS_SET_COMPLEXITY_REQUEST, int(complexity))
+        dll.opus_encoder_ctl(st, _OPUS_RESET_STATE, 0)
+    dll.opus_encoder_ctl(st, _OPUS_SET_BITRATE_REQUEST, int(bitrate))
+    dll.opus_encoder_ctl(st, _OPUS_SET_COMPLEXITY_REQUEST, int(complexity))
     return st, _TLS_ENCODERS.voip_ptr, _TLS_ENCODERS.voip_mv
 
 
 def encode_sogou_ws_frames(pcm_bytes: bytes, bitrate: int = 24000) -> bytes:
-    """零拷贝编码为搜狗 `OPUS_WITH_HEADER` (`>H` + 20ms Opus) 并直接写入连续 RFC 6455 二进制帧流"""
-    if not pcm_bytes or _LIBOPUS is None:
+    """
+    零拷贝编码为搜狗 `OPUS_WITH_HEADER` (`>H` + 20ms Opus) 并直接写入连续 RFC 6455 二进制帧流。
+    完整支持任意码率 (6kbps ~ 510kbps)：当单帧长度 `n + 2 >= 126` 时自动切换 16-bit 扩展帧头 (`0xFE`)。
+    """
+    if not pcm_bytes:
         return b""
+    dll = ensure_libopus()
     st, ptr, mv = _get_tls_voip_encoder(bitrate=bitrate, complexity=1)
-    encode_fn = _LIBOPUS.opus_encode
+    encode_fn = dll.opus_encode
     pack_hdr = _PACK_SOGOU_WS_HDR
+    pack_hdr16 = _PACK_SOGOU_WS_HDR16
     ws_out = bytearray()
     total = len(pcm_bytes)
     for off in range(0, total, 640):
         ch = pcm_bytes[off : off + 640]
         if len(ch) < 640:
             ch = ch + b"\x00" * (640 - len(ch))
-        n = encode_fn(st, ch, 320, ptr, 512)
+        n = encode_fn(st, ch, 320, ptr, 1280)
         if n < 0:
             raise RuntimeError(f"opus_encode 错误: {n}")
-        ws_out += pack_hdr(0x82, 0x80 | (n + 2), b"\x00\x00\x00\x00", n)
+        plen = n + 2
+        if plen < 126:
+            ws_out += pack_hdr(0x82, 0x80 | plen, b"\x00\x00\x00\x00", n)
+        else:
+            ws_out += pack_hdr16(0x82, 0xFE, plen, b"\x00\x00\x00\x00", n)
         ws_out += mv[:n]
     return bytes(ws_out)
 
 
 def encode_opus_packets(pcm_bytes: bytes, frame_ms: int = 20, bitrate: int = 24000) -> List[bytes]:
     """通用零依赖 Opus 分帧编码工具函数（供自定义扩展 ASR 引擎插件调用）"""
-    if not pcm_bytes or _LIBOPUS is None:
+    if not pcm_bytes:
         return []
+    dll = ensure_libopus()
     st, ptr, mv = _get_tls_voip_encoder(bitrate=bitrate, complexity=1)
-    encode_fn = _LIBOPUS.opus_encode
+    encode_fn = dll.opus_encode
     frame_samples = (16000 * frame_ms) // 1000
     frame_bytes = frame_samples * 2
     frames: List[bytes] = []
@@ -134,7 +157,7 @@ def encode_opus_packets(pcm_bytes: bytes, frame_ms: int = 20, bitrate: int = 240
         ch = pcm_bytes[off : off + frame_bytes]
         if len(ch) < frame_bytes:
             ch = ch + b"\x00" * (frame_bytes - len(ch))
-        n = encode_fn(st, ch, frame_samples, ptr, 512)
+        n = encode_fn(st, ch, frame_samples, ptr, 1280)
         if n < 0:
             raise RuntimeError(f"opus_encode 错误: {n}")
         frames.append(bytes(mv[:n]))
@@ -142,17 +165,17 @@ def encode_opus_packets(pcm_bytes: bytes, frame_ms: int = 20, bitrate: int = 240
 
 
 def compute_rms(pcm_bytes: bytes) -> float:
+    """精确计算 16-bit PCM 全样本均方根能量 (RMS)，不抽样、无偏差"""
     n = (len(pcm_bytes) // 2) * 2
     if n == 0:
         return 0.0
     if _audioop is not None:
         return float(_audioop.rms(pcm_bytes[:n], 2))
     samples = memoryview(pcm_bytes)[:n].cast("h")
-    sub = samples[::4] if len(samples) >= 320 else samples
-    cnt = len(sub)
+    cnt = len(samples)
     if cnt == 0:
         return 0.0
-    return math.sqrt(sum(x * x for x in sub) / cnt)
+    return float(int(math.sqrt(sum(x * x for x in samples) / cnt)))
 
 
 def split_pcm_by_silence(

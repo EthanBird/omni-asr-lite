@@ -148,6 +148,16 @@ class TranscriptResult:
         return [s.text for s in self.segments if s.text.strip()]
 
     @property
+    def failed_segments(self) -> List[int]:
+        """返回所有重试后仍失败的分片序号列表（正常情况下应为空列表 []）"""
+        return [s.index for s in self.segments if s.engine in ("failed", "timeout")]
+
+    @property
+    def silent_segments(self) -> List[int]:
+        """返回纯静音或纯背景音乐无语音的分片序号列表"""
+        return [s.index for s in self.segments if not s.text.strip() and s.engine not in ("failed", "timeout")]
+
+    @property
     def engine_stats(self) -> Dict[str, int]:
         counts: Dict[str, int] = {}
         for s in self.segments:
@@ -181,14 +191,17 @@ class TranscriptResult:
 
     def to_markdown(self, title: str = "Omni-ASR-Lite 语音转文字与豆包 LLM 智能整理成稿") -> str:
         stats_str = ", ".join(f"{k}: {v}段" for k, v in self.engine_stats.items()) or "无"
+        silent_cnt = len(self.silent_segments)
+        failed_cnt = len(self.failed_segments)
+        seg_summary = f"有声 `{len(self.lines)}` 段 / 静音或纯BGM `{silent_cnt}` 段 / 失败 `{failed_cnt}` 段 (共 `{len(self.segments)}` 段)"
         md = [
             f"# {title}\n",
             f"- **音频来源**: `{self.source or 'PCM Stream'}`",
             f"- **调度模式**: `{self.mode}` (引擎分片分布: `{stats_str}`)",
             f"- **音频时长**: `{self.duration:.1f}s` ({self.duration / 60.0:.1f} 分钟)",
-            f"- **端到端总耗时**: `{self.elapsed_sec:.2f}s` (解码+ASR流水线 `{self.asr_sec:.2f}s` + LLM收尾 `{self.organize_tail_sec:.2f}s`)",
-            f"- **综合实时倍率**: `{self.duration / max(0.001, self.elapsed_sec):.1f}x` (ASR 阶段 `{self.duration / max(0.001, self.asr_sec):.1f}x`)",
-            f"- **有效片段**: `{len(self.lines)} / {len(self.segments)}` 段\n",
+            f"- **端到端总耗时**: `{self.elapsed_sec:.2f}s` (解码+ASR阶段 `{self.asr_sec:.2f}s` + LLM收尾 `{self.organize_tail_sec:.2f}s`)",
+            f"- **实时加速比**: 端到端综合 `{self.duration / max(0.001, self.elapsed_sec):.1f}x` | 纯 ASR 阶段 `{self.duration / max(0.001, self.asr_sec):.1f}x`",
+            f"- **分片统计**: {seg_summary}\n",
         ]
         if self.organized_text.strip():
             md.extend([

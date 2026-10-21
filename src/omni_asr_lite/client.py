@@ -13,6 +13,7 @@ import asyncio
 import os
 import shutil
 import time
+import warnings
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, List, Optional, Union
 
 from .audio import (
@@ -198,10 +199,13 @@ class OmniASR:
         organize_workers: int = 12,
         organize_chunk_chars: int = 380,
         enable_hedging: bool = True,
+        strict: bool = False,
         on_segment: Optional[Callable[[Segment], None]] = None,
     ) -> TranscriptResult:
         """
         将任意时长音频/视频文件或 PCM 字节流转写为 `TranscriptResult`。
+        若 `strict=True`，当存在重试后仍失败的分片 (`result.failed_segments`) 时将抛出 `RuntimeError`；
+        默认 `strict=False` 时会发出 `UserWarning` 显式告警并保留其余成功分片。
         """
         t0 = time.perf_counter()
         if not split:
@@ -236,7 +240,7 @@ class OmniASR:
 
         total_dur = segments[-1].end if segments else 0.0
         elapsed = time.perf_counter() - t0
-        return TranscriptResult(
+        result = TranscriptResult(
             segments=segments,
             organized_text=org_text,
             duration=round(total_dur, 2),
@@ -248,6 +252,12 @@ class OmniASR:
             organize_tail_sec=org_tail_sec,
             engine_metrics=metrics_dict,
         )
+        if result.failed_segments:
+            msg = f"OmniASR 告警：共有 {len(result.failed_segments)} 个分片在重试后仍失败: {result.failed_segments}"
+            if strict:
+                raise RuntimeError(msg)
+            warnings.warn(msg, UserWarning, stacklevel=2)
+        return result
 
 
 _DEFAULT_CLIENT: Optional[OmniASR] = None

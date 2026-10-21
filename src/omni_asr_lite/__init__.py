@@ -8,6 +8,7 @@ from .audio import (
     compute_rms,
     encode_opus_packets,
     encode_sogou_ws_frames,
+    ensure_libopus,
     iter_pcm16k_chunks,
     iter_vad_segments_streaming,
     load_pcm16k,
@@ -20,6 +21,7 @@ from .engines import (
     CallableASREngine,
     SOGOU_LANGUAGES,
     SogouEngine,
+    SogouStreamConnection,
     coerce_engine,
     normalize_sogou_language,
 )

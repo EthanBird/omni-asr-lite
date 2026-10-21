@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 豆包官方免鉴权 LLM「智能整理」与无队头阻塞分桶流式整理器 (`omni_asr_lite.organizer`)：
-仅调用公开免鉴权的文本规整接口 `https://ime.oceancloudapi.com/api/v2/ai/text_organization` (`scene=6`)，
-提供口语去水词、标点断句、中英文间距与结构化分段。
+1. 针对豆包服务端偶发单连接长尾卡顿（如 ~18s 慢响应），实装 **1.6s 投机对冲重试 (Speculative LLM Hedging)** +
+   **6.0s 硬超时自动降级回原文**：当主请求超过 1.6s 未返回时，立即在新建连接上并发发起备份对冲请求，谁先返回用谁！
+2. `StreamingLLMOrganizer`：按 7 段定长分桶无队头阻塞并发提交，收尾微块 220 字极速收口。
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 import json
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .http_pool import HTTPSConnectionPool
 from .models import Segment
@@ -71,15 +72,17 @@ def _join_seg_texts(texts: List[str]) -> str:
 
 
 class DoubaoOrganizer:
-    """豆包官方免鉴权 LLM「智能整理」并发客户端"""
+    """豆包官方免鉴权 LLM「智能整理」并发客户端（带 1.6s 投机对冲与 6.0s 硬超时降级保护）"""
 
-    def __init__(self, timeout: float = 45.0):
-        self.pool = HTTPSConnectionPool(DOUBAO_ORGANIZE_HOST, timeout=timeout, max_pool_size=20)
+    def __init__(self, timeout: float = 6.0, hedge_delay: float = 1.6):
+        self.timeout = timeout
+        self.hedge_delay = hedge_delay
+        self.pool = HTTPSConnectionPool(DOUBAO_ORGANIZE_HOST, timeout=timeout, max_pool_size=24)
 
     def prewarm(self, count: int = 8) -> None:
         def _warm_one():
             try:
-                conn = self.pool._create_conn(timeout=8.0)
+                conn = self.pool._create_conn(timeout=5.0)
                 self.pool._release(conn)
             except Exception:
                 pass
@@ -87,17 +90,43 @@ class DoubaoOrganizer:
         for _ in range(max(0, count)):
             threading.Thread(target=_warm_one, daemon=True).start()
 
+    def _call_once(self, body: bytes, timeout: float, fresh: bool = False) -> Optional[str]:
+        try:
+            status, raw_bytes = self.pool.post(
+                DOUBAO_ORGANIZE_PATH,
+                body,
+                headers={"Content-Type": "application/json", "User-Agent": DOUBAO_ORGANIZE_UA},
+                timeout=timeout,
+                fresh=fresh,
+            )
+            if status == 200 and raw_bytes:
+                d = json.loads(raw_bytes.decode("utf-8", "ignore"))
+                if d.get("code") == 0:
+                    content = (d.get("data") or {}).get("content")
+                    if content:
+                        return str(content)
+        except Exception:
+            pass
+        return None
+
     def organize_single(
         self,
         text: str,
         *,
         space_cn_en: int = 1,
         space_newline: int = 0,
-        timeout: float = 45.0,
+        timeout: Optional[float] = None,
     ) -> str:
+        """
+        整理单个文本块：
+        - 主请求若在 `self.hedge_delay` (默认 1.6s) 内返回，直接零额外开销返回；
+        - 若主请求超过 1.6s 仍未响应（遇到偶发服务端慢连接），立即在新建 TLS 连接上并发发起备份对冲请求，
+          主备任意一方率先成功即刻唤醒返回，总等待上限严格不超过 `timeout` (默认 6.0s)，超时平稳降级回原文本！
+        """
         text = text.strip()
         if not text:
             return ""
+        to = timeout or self.timeout
         body = json.dumps(
             {
                 "scene": DOUBAO_ORGANIZE_SCENE,
@@ -109,22 +138,32 @@ class DoubaoOrganizer:
             ensure_ascii=False,
         ).encode("utf-8")
 
-        for attempt in range(2):
-            try:
-                status, raw_bytes = self.pool.post(
-                    DOUBAO_ORGANIZE_PATH,
-                    body,
-                    headers={"Content-Type": "application/json", "User-Agent": DOUBAO_ORGANIZE_UA},
-                    timeout=timeout,
-                )
-                if status == 200 and raw_bytes:
-                    d = json.loads(raw_bytes.decode("utf-8", "ignore"))
-                    if d.get("code") == 0:
-                        return (d.get("data") or {}).get("content") or text
-            except Exception:
-                if attempt == 1:
-                    return text
-        return text
+        done_ev = threading.Event()
+        winner: List[str] = []
+        lock = threading.Lock()
+
+        def _worker(fresh_conn: bool):
+            res = self._call_once(body, timeout=to, fresh=fresh_conn)
+            if res:
+                with lock:
+                    if not winner:
+                        winner.append(res)
+                        done_ev.set()
+
+        t1 = threading.Thread(target=_worker, args=(False,), daemon=True)
+        t1.start()
+
+        # 等待主请求 hedge_delay 秒（通常 0.25~0.5s 即完成）
+        if done_ev.wait(timeout=min(self.hedge_delay, to)):
+            return winner[0] if winner else text
+
+        # 主请求超过 1.6s 未返回：启动新建连接备份对冲请求，彻底消除 18s 偶发卡顿
+        t2 = threading.Thread(target=_worker, args=(True,), daemon=True)
+        t2.start()
+
+        rem = max(0.2, to - self.hedge_delay)
+        done_ev.wait(timeout=rem)
+        return winner[0] if winner else text
 
     def organize_text(
         self,
@@ -132,7 +171,7 @@ class DoubaoOrganizer:
         *,
         max_chunk_chars: int = 420,
         workers: int = 10,
-        timeout: float = 45.0,
+        timeout: float = 6.0,
     ) -> str:
         text = text.strip()
         if not text:
